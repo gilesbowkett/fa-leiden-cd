@@ -2,13 +2,17 @@
 name = "fa-leiden-cd"
 version = "0.1.0"
 edition = "2021"
+description = "A Rust implementation of the Leiden algorithm for community detection in large networks."
+homepage = "https://github.com/fixed-ai/fa-leiden-cd"
+repository = "https://github.com/fixed-ai/fa-leiden-cd"
+license-file = "LICENSE"
+keywords = ["community-detection", "leiden-algorithm", "graph", "rag"]
 
 [dependencies]
 boxcar = "0.2.14"
 hashbrown = "0.15.5"
 rayon = "1.11.0"
 serde = { version = "1.0.219", features = ["derive"], optional = true }
-
 
 [features]
 default = ["serde"]
