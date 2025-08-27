@@ -1,0 +1,15 @@
+[package]
+name = "fa-leiden-cd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+boxcar = "0.2.14"
+hashbrown = "0.15.5"
+rayon = "1.11.0"
+serde = { version = "1.0.219", features = ["derive"], optional = true }
+
+
+[features]
+default = ["serde"]
+serde = ["dep:serde", "hashbrown/serde"]
