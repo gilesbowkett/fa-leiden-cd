@@ -730,7 +730,7 @@ mod tests {
         // Total weight m = 3*10 + 3*10 + 1 = 61.
         // With the correct 2-community assignment the weighted modularity should be:
         //   Q ≈ 0.6503
-        // The unweighted-degree bug produces Q ≈ 0.979, so this test distinguishes them.
+        // The unweighted-degree bug produced Q ≈ 0.979, so this test distinguishes them.
         let mut g: Graph<usize, ()> = Graph::new();
         let nodes: Vec<usize> = (0..6).map(|i| g.add_node(i)).collect();
 
@@ -755,7 +755,7 @@ mod tests {
         }
 
         let q = g.compute_modularity(&assignments);
-        // Correct weighted Q ≈ 0.6503; buggy unweighted Q ≈ 0.979
+        // Correct weighted Q ≈ 0.6503; incorrect unweighted Q ≈ 0.979
         assert!(
             (q - 0.6503_f32).abs() < 0.01,
             "expected Q ≈ 0.6503, got {}",
