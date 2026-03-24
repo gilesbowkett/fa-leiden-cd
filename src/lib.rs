@@ -78,7 +78,7 @@ pub struct TrivialModularityOptimizer {
 impl ModularityOptimizer for TrivialModularityOptimizer {
     #[inline]
     fn is_converged(&mut self, previous: f32, current: f32) -> bool {
-        previous - current < self.tol
+        current - previous < self.tol
     }
 
     #[inline]
@@ -222,17 +222,27 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
             };
         }
 
+        // Precompute weighted degrees: k[i] = sum of incident edge weights.
+        let weighted_degrees: Vec<f32> = (0..node_count)
+            .map(|i| {
+                self._connections[i]
+                    .values()
+                    .map(|&edge_id| self._edges[edge_id].weight)
+                    .sum()
+            })
+            .collect();
+
         for i in 0..node_count {
             let assigni = get_assignment!(i);
             let conn_i = &self._connections[i];
-            let ki = conn_i.len() as f32;
+            let ki = weighted_degrees[i];
             for j in (i + 1)..node_count {
                 let assignj = get_assignment!(j);
                 if assigni != assignj {
                     continue;
                 }
 
-                let kj = self._connections[j].len() as f32;
+                let kj = weighted_degrees[j];
 
                 match conn_i.get(&j) {
                     Some(edge_ij) => {
@@ -576,17 +586,16 @@ fn compress_l1<N, E>(
     let node_count = graph.count_nodes();
     for i in 0..node_count {
         let assigni = node_to_community[&i];
-
-        for j in i + 1..node_count {
+        for (&j, &edge_id) in &graph._connections[i] {
+            if j <= i {
+                continue; // process each undirected edge once
+            }
             let assignj = node_to_community[&j];
-
             if assigni == assignj {
                 continue;
             }
-
-            if let Some(edge_info) = graph.try_get_edge_between(i, j) {
-                new_graph.add_edge(assigni as usize, assignj as usize, (), edge_info.weight);
-            }
+            let weight = graph._edges[edge_id].weight;
+            new_graph.add_edge(assigni as usize, assignj as usize, (), weight);
         }
     }
 
@@ -637,17 +646,16 @@ fn compress_ln<E>(
     let node_count = graph.count_nodes();
     for i in 0..node_count {
         let assigni = node_to_community[&i];
-
-        for j in i + 1..node_count {
+        for (&j, &edge_id) in &graph._connections[i] {
+            if j <= i {
+                continue; // process each undirected edge once
+            }
             let assignj = node_to_community[&j];
-
             if assigni == assignj {
                 continue;
             }
-
-            if let Some(edge_info) = graph.try_get_edge_between(i, j) {
-                new_graph.add_edge(assigni as usize, assignj as usize, (), edge_info.weight);
-            }
+            let weight = graph._edges[edge_id].weight;
+            new_graph.add_edge(assigni as usize, assignj as usize, (), weight);
         }
     }
 
@@ -714,6 +722,45 @@ mod tests {
                 println!("     {}", n);
             });
         }
+    }
+
+    #[test]
+    fn test_weighted_modularity() {
+        // Two 3-cliques (intra weight 10.0) connected by a single bridge (weight 1.0).
+        // Total weight m = 3*10 + 3*10 + 1 = 61.
+        // With the correct 2-community assignment the weighted modularity should be:
+        //   Q ≈ 0.6503
+        // The unweighted-degree bug produces Q ≈ 0.979, so this test distinguishes them.
+        let mut g: Graph<usize, ()> = Graph::new();
+        let nodes: Vec<usize> = (0..6).map(|i| g.add_node(i)).collect();
+
+        // Clique A: 0-1-2
+        g.add_edge(nodes[0], nodes[1], (), 10.0);
+        g.add_edge(nodes[0], nodes[2], (), 10.0);
+        g.add_edge(nodes[1], nodes[2], (), 10.0);
+        // Clique B: 3-4-5
+        g.add_edge(nodes[3], nodes[4], (), 10.0);
+        g.add_edge(nodes[3], nodes[5], (), 10.0);
+        g.add_edge(nodes[4], nodes[5], (), 10.0);
+        // Bridge 2-3
+        g.add_edge(nodes[2], nodes[3], (), 1.0);
+
+        // Perfect 2-community assignment: {0,1,2} → 0, {3,4,5} → 1
+        let mut assignments = g.initial_community();
+        for &n in &nodes[0..3] {
+            assignments.insert(n, 0u32);
+        }
+        for &n in &nodes[3..6] {
+            assignments.insert(n, 1u32);
+        }
+
+        let q = g.compute_modularity(&assignments);
+        // Correct weighted Q ≈ 0.6503; buggy unweighted Q ≈ 0.979
+        assert!(
+            (q - 0.6503_f32).abs() < 0.01,
+            "expected Q ≈ 0.6503, got {}",
+            q
+        );
     }
 
     #[test]
