@@ -158,24 +158,6 @@ pub struct LocalMove {
 
 type CommunityAssignments = HashMap<usize, CommunityId>;
 
-trait MaybeLocalMove {
-    fn get(&self) -> Option<&LocalMove>;
-}
-
-impl MaybeLocalMove for LocalMove {
-    #[inline]
-    fn get(&self) -> Option<&LocalMove> {
-        Some(self)
-    }
-}
-
-impl MaybeLocalMove for () {
-    #[inline]
-    fn get(&self) -> Option<&LocalMove> {
-        None
-    }
-}
-
 impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
     pub fn initial_community(&self) -> CommunityAssignments {
         let count_nodes = self.count_nodes();
@@ -186,44 +168,10 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
         assignments
     }
 
-    #[inline]
     pub fn compute_modularity(&self, assignments: &CommunityAssignments) -> f32 {
-        self._compute_modularity_impl(assignments, ())
-    }
-
-    #[inline]
-    pub fn compute_modularity_with_local_move(
-        &self,
-        assignments: &CommunityAssignments,
-        local_move: LocalMove,
-    ) -> f32 {
-        self._compute_modularity_impl(assignments, local_move)
-    }
-
-    #[inline]
-    fn _compute_modularity_impl(
-        &self,
-        assignments: &CommunityAssignments,
-        local_move: impl MaybeLocalMove,
-    ) -> f32 {
         let m = self._total_weight;
         let node_count: usize = self.count_nodes();
         let mut q = 0.0;
-
-        macro_rules! get_assignment {
-            ($i:ident) => {
-                match local_move.get() {
-                    None => assignments[&$i],
-                    Some(local_move) => {
-                        if local_move.node == $i {
-                            local_move.community
-                        } else {
-                            assignments[&$i]
-                        }
-                    }
-                }
-            };
-        }
 
         // Precompute weighted degrees: k[i] = sum of incident edge weights.
         let weighted_degrees: Vec<f32> = (0..node_count)
@@ -236,11 +184,11 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
             .collect();
 
         for i in 0..node_count {
-            let assigni = get_assignment!(i);
+            let assigni = assignments[&i];
             let conn_i = &self._connections[i];
             let ki = weighted_degrees[i];
             for j in (i + 1)..node_count {
-                let assignj = get_assignment!(j);
+                let assignj = assignments[&j];
                 if assigni != assignj {
                     continue;
                 }
@@ -260,7 +208,7 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
             }
         }
 
-        return q / m;
+        q / m
     }
 
     fn optimize_modularity(
