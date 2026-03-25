@@ -168,7 +168,28 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
         assignments
     }
 
-    pub fn compute_modularity(&self, assignments: &CommunityAssignments) -> f32 {
+    #[inline]
+    pub fn compute_modularity(&self, assignments: &CommunityAssignments, gamma: f32) -> f32 {
+        self._compute_modularity_impl(assignments, (), gamma)
+    }
+
+    #[inline]
+    pub fn compute_modularity_with_local_move(
+        &self,
+        assignments: &CommunityAssignments,
+        local_move: LocalMove,
+        gamma: f32,
+    ) -> f32 {
+        self._compute_modularity_impl(assignments, local_move, gamma)
+    }
+
+    #[inline]
+    fn _compute_modularity_impl(
+        &self,
+        assignments: &CommunityAssignments,
+        local_move: impl MaybeLocalMove,
+        gamma: f32,
+    ) -> f32 {
         let m = self._total_weight;
         let node_count: usize = self.count_nodes();
         let mut q = 0.0;
@@ -195,27 +216,45 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
 
                 let kj = weighted_degrees[j];
 
-                match conn_i.binary_search_by_key(&j, |&(nb, _)| nb) {
-                    Ok(pos) => {
-                        let edge_id = conn_i[pos].1;
-                        let edge_ij_weight = self._edges[edge_id].weight;
-                        q += edge_ij_weight - (ki * kj) / (m + m);
+                match conn_i.get(&j) {
+                    Some(edge_ij) => {
+                        let edge_ij = *edge_ij;
+                        let edge_ij_weight = self._edges[edge_ij].weight;
+                        q += edge_ij_weight - gamma * (ki * kj) / (m + m);
                     }
-                    Err(_) => {
-                        q += -ki * kj / (m + m);
+                    None => {
+                        q += -gamma * ki * kj / (m + m);
                     }
                 }
             }
         }
 
-        q / m
+        q / m;
+    }
+
+    /// Move a single node to avoid local minimal
+    fn _optimize_modularity_handle_pitfall(
+        &self,
+        assignments: &mut CommunityAssignments,
+        current_modularity: f32,
+        gamma: f32,
+    ) {
+        let node_count = self.count_nodes();
+        for i in 0..node_count {
+            let node = i;
+            if let Some(local_move) = self.fast_local_move(node, assignments, current_modularity, gamma) {
+                assignments.insert(local_move.node, local_move.community);
+            }
+        }
     }
 
     fn optimize_modularity(
         &self,
         assignments: &mut CommunityAssignments,
         optimizer: &mut impl ModularityOptimizer,
+        gamma: f32,
     ) {
+        let mut current_modularity = self.compute_modularity(assignments, gamma);
         let node_count = self.count_nodes();
 
         // Precompute weighted degrees once.
@@ -243,7 +282,7 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
                 let mut any_moved = false;
                 for i in 0..node_count {
                     if let Some(local_move) =
-                        self.fast_local_move(i, assignments, &weighted_degrees, &sigma_tot)
+                        self.fast_local_move(node, assignments, current_modularity, gamma)
                     {
                         let old_community = assignments[&local_move.node];
                         let new_community = local_move.community;
@@ -254,7 +293,23 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
                         any_moved = true;
                     }
                 }
-                if !any_moved {
+
+                if batch_moving.is_empty() {
+                    break;
+                } else {
+                    for local_move in batch_moving.iter() {
+                        assignments.insert(local_move.node, local_move.community);
+                    }
+                    batch_moving.clear();
+                }
+
+                current_modularity = self.compute_modularity(assignments, gamma);
+                if current_modularity == previous_modularity {
+                    // but batch_moving is not empty
+                    // in this case we randomly choose a node to move to avoid local minimal
+                    self._optimize_modularity_handle_pitfall(assignments, current_modularity, gamma);
+                }
+                if optimizer.is_converged(previous_modularity, current_modularity) {
                     break;
                 }
             }
@@ -267,7 +322,7 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
             loop {
                 (0..node_count).into_par_iter().for_each(|node| {
                     if let Some(local_move) =
-                        self.fast_local_move(node, assignments, &weighted_degrees, &sigma_tot)
+                        self.fast_local_move(node, assignments, current_modularity, gamma)
                     {
                         batch_moving.push(local_move);
                     }
@@ -277,13 +332,12 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
                     break;
                 }
 
-                for (_, local_move) in batch_moving.iter() {
-                    let old_community = assignments[&local_move.node];
-                    let new_community = local_move.community;
-                    let k = weighted_degrees[local_move.node];
-                    *sigma_tot.get_mut(&old_community).unwrap() -= k;
-                    *sigma_tot.entry(new_community).or_insert(0.0) += k;
-                    assignments.insert(local_move.node, new_community);
+                current_modularity = self.compute_modularity(assignments, gamma);
+
+                if current_modularity == previous_modularity {
+                    // but batch_moving is not empty
+                    // in this case we randomly choose a node to move to avoid local minimal
+                    self._optimize_modularity_handle_pitfall(assignments, current_modularity, gamma);
                 }
 
                 batch_moving.clear();
@@ -303,8 +357,8 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
         &self,
         node: usize,
         assignments: &CommunityAssignments,
-        weighted_degrees: &[f32],
-        sigma_tot: &HashMap<CommunityId, f32>,
+        current_modularity: f32,
+        gamma: f32,
     ) -> Option<LocalMove> {
         let m = self._total_weight;
         let k_i = weighted_degrees[node];
@@ -330,12 +384,20 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
             if c_j == c_i {
                 continue;
             }
-            let sigma_j = sigma_tot.get(&c_j).copied().unwrap_or(0.0);
-            let score = k_i_to_j / m - k_i * sigma_j / (2.0 * m * m);
-            let gain = score - baseline;
-            if gain > best_gain {
-                best_gain = gain;
-                best_community = c_j;
+
+            let new_modularity = self.compute_modularity_with_local_move(
+                assignments,
+                LocalMove {
+                    node,
+                    community: neighbor_assign,
+                },
+                gamma,
+            );
+
+            if new_modularity > current_modularity {
+                best_assign = neighbor_assign;
+                current_modularity = new_modularity;
+                changed = true;
             }
         }
 
@@ -449,12 +511,13 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
         &self,
         max_iter: Option<usize>,
         optimizer: &mut impl ModularityOptimizer,
+        gamma: f32,
     ) -> Graph<Community, ()> {
         let mut high_level_graph: Graph<Community, ()>;
         {
-            let g = leiden_l1(&self, optimizer);
+            let g = leiden_l1(&self, optimizer, gamma);
             let node_count_g1 = g.count_nodes();
-            let g = leiden_ln(g, optimizer);
+            let g = leiden_ln(g, optimizer, gamma);
             let node_count_g2 = g.count_nodes();
             if node_count_g2 == node_count_g1 {
                 return g;
@@ -468,7 +531,7 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
         if let Some(mut max_iter) = max_iter {
             loop {
                 previous = count;
-                high_level_graph = leiden_ln(high_level_graph, optimizer);
+                high_level_graph = leiden_ln(high_level_graph, optimizer, gamma);
                 count = high_level_graph.count_nodes();
                 if (previous == count) | (max_iter == 0) {
                     break;
@@ -478,7 +541,7 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
         } else {
             loop {
                 previous = count;
-                high_level_graph = leiden_ln(high_level_graph, optimizer);
+                high_level_graph = leiden_ln(high_level_graph, optimizer, gamma);
                 count = high_level_graph.count_nodes();
                 if previous == count {
                     break;
@@ -493,9 +556,10 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
 fn leiden_l1<N: Send + Sync, E: Send + Sync>(
     graph: &Graph<N, E>,
     optimizer: &mut impl ModularityOptimizer,
+    gamma: f32,
 ) -> Graph<Community, ()> {
     let mut community_assignments = graph.initial_community();
-    graph.optimize_modularity(&mut community_assignments, optimizer);
+    graph.optimize_modularity(&mut community_assignments, optimizer, gamma);
     let communities = graph.refine(&community_assignments);
     return compress_l1(graph, communities);
 }
@@ -503,9 +567,10 @@ fn leiden_l1<N: Send + Sync, E: Send + Sync>(
 fn leiden_ln(
     graph: Graph<Community, ()>,
     optimizer: &mut impl ModularityOptimizer,
+    gamma: f32,
 ) -> Graph<Community, ()> {
     let mut community_assignments = graph.initial_community();
-    graph.optimize_modularity(&mut community_assignments, optimizer);
+    graph.optimize_modularity(&mut community_assignments, optimizer, gamma);
     let communities = graph.refine(&community_assignments);
     if communities.len() == graph._nodes.len() {
         return graph;
@@ -663,7 +728,7 @@ mod tests {
             tol: 1e-11,
         };
 
-        let hierarchy = g.leiden(Some(100), &mut optimizer);
+        let hierarchy = g.leiden(Some(100), &mut optimizer, 1.0);
         for (i, node) in hierarchy.node_data_slice().iter().enumerate() {
             println!("community {}:", i);
             node.collect_nodes(&|i| {
@@ -703,7 +768,7 @@ mod tests {
             assignments.insert(n, 1u32);
         }
 
-        let q = g.compute_modularity(&assignments);
+        let q = g.compute_modularity(&assignments, 1.0);
         // Correct weighted Q ≈ 0.6503; incorrect unweighted Q ≈ 0.979
         assert!(
             (q - 0.6503_f32).abs() < 0.01,
@@ -741,7 +806,7 @@ mod tests {
 
         let assignments = RefCell::new(g.initial_community());
 
-        let hierarchy = g.leiden(Some(100), &mut optimizer);
+        let hierarchy = g.leiden(Some(100), &mut optimizer, 1.0);
         for (i, node) in hierarchy.node_data_slice().iter().enumerate() {
             println!("community {}:", i);
             let comm = i;
@@ -756,7 +821,7 @@ mod tests {
 
         println!(
             "real modularity: {}",
-            g.compute_modularity(&assignments.borrow())
+            g.compute_modularity(&assignments.borrow(), 1.0)
         );
     }
 }
