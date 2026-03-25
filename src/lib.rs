@@ -168,28 +168,7 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
         assignments
     }
 
-    #[inline]
     pub fn compute_modularity(&self, assignments: &CommunityAssignments, gamma: f32) -> f32 {
-        self._compute_modularity_impl(assignments, (), gamma)
-    }
-
-    #[inline]
-    pub fn compute_modularity_with_local_move(
-        &self,
-        assignments: &CommunityAssignments,
-        local_move: LocalMove,
-        gamma: f32,
-    ) -> f32 {
-        self._compute_modularity_impl(assignments, local_move, gamma)
-    }
-
-    #[inline]
-    fn _compute_modularity_impl(
-        &self,
-        assignments: &CommunityAssignments,
-        local_move: impl MaybeLocalMove,
-        gamma: f32,
-    ) -> f32 {
         let m = self._total_weight;
         let node_count: usize = self.count_nodes();
         let mut q = 0.0;
@@ -216,36 +195,20 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
 
                 let kj = weighted_degrees[j];
 
-                match conn_i.get(&j) {
-                    Some(edge_ij) => {
-                        let edge_ij = *edge_ij;
-                        let edge_ij_weight = self._edges[edge_ij].weight;
+                match conn_i.binary_search_by_key(&j, |&(nb, _)| nb) {
+                    Ok(pos) => {
+                        let edge_id = conn_i[pos].1;
+                        let edge_ij_weight = self._edges[edge_id].weight;
                         q += edge_ij_weight - gamma * (ki * kj) / (m + m);
                     }
-                    None => {
+                    Err(_) => {
                         q += -gamma * ki * kj / (m + m);
                     }
                 }
             }
         }
 
-        q / m;
-    }
-
-    /// Move a single node to avoid local minimal
-    fn _optimize_modularity_handle_pitfall(
-        &self,
-        assignments: &mut CommunityAssignments,
-        current_modularity: f32,
-        gamma: f32,
-    ) {
-        let node_count = self.count_nodes();
-        for i in 0..node_count {
-            let node = i;
-            if let Some(local_move) = self.fast_local_move(node, assignments, current_modularity, gamma) {
-                assignments.insert(local_move.node, local_move.community);
-            }
-        }
+        q / m
     }
 
     fn optimize_modularity(
@@ -254,7 +217,6 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
         optimizer: &mut impl ModularityOptimizer,
         gamma: f32,
     ) {
-        let mut current_modularity = self.compute_modularity(assignments, gamma);
         let node_count = self.count_nodes();
 
         // Precompute weighted degrees once.
@@ -282,7 +244,7 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
                 let mut any_moved = false;
                 for i in 0..node_count {
                     if let Some(local_move) =
-                        self.fast_local_move(node, assignments, current_modularity, gamma)
+                        self.fast_local_move(i, assignments, &weighted_degrees, &sigma_tot, gamma)
                     {
                         let old_community = assignments[&local_move.node];
                         let new_community = local_move.community;
@@ -293,23 +255,7 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
                         any_moved = true;
                     }
                 }
-
-                if batch_moving.is_empty() {
-                    break;
-                } else {
-                    for local_move in batch_moving.iter() {
-                        assignments.insert(local_move.node, local_move.community);
-                    }
-                    batch_moving.clear();
-                }
-
-                current_modularity = self.compute_modularity(assignments, gamma);
-                if current_modularity == previous_modularity {
-                    // but batch_moving is not empty
-                    // in this case we randomly choose a node to move to avoid local minimal
-                    self._optimize_modularity_handle_pitfall(assignments, current_modularity, gamma);
-                }
-                if optimizer.is_converged(previous_modularity, current_modularity) {
+                if !any_moved {
                     break;
                 }
             }
@@ -317,12 +263,12 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
             // Parallel path: collect moves in parallel (read-only snapshot of state),
             // apply serially, check convergence via global modularity to detect cycling.
             let mut batch_moving: boxcar::Vec<LocalMove> = boxcar::Vec::new();
-            let mut previous_modularity = self.compute_modularity(assignments);
+            let mut previous_modularity = self.compute_modularity(assignments, gamma);
 
             loop {
                 (0..node_count).into_par_iter().for_each(|node| {
                     if let Some(local_move) =
-                        self.fast_local_move(node, assignments, current_modularity, gamma)
+                        self.fast_local_move(node, assignments, &weighted_degrees, &sigma_tot, gamma)
                     {
                         batch_moving.push(local_move);
                     }
@@ -332,17 +278,18 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
                     break;
                 }
 
-                current_modularity = self.compute_modularity(assignments, gamma);
-
-                if current_modularity == previous_modularity {
-                    // but batch_moving is not empty
-                    // in this case we randomly choose a node to move to avoid local minimal
-                    self._optimize_modularity_handle_pitfall(assignments, current_modularity, gamma);
+                for (_, local_move) in batch_moving.iter() {
+                    let old_community = assignments[&local_move.node];
+                    let new_community = local_move.community;
+                    let k = weighted_degrees[local_move.node];
+                    *sigma_tot.get_mut(&old_community).unwrap() -= k;
+                    *sigma_tot.entry(new_community).or_insert(0.0) += k;
+                    assignments.insert(local_move.node, new_community);
                 }
 
                 batch_moving.clear();
 
-                let current_modularity = self.compute_modularity(assignments);
+                let current_modularity = self.compute_modularity(assignments, gamma);
                 if optimizer.is_converged(previous_modularity, current_modularity) {
                     break;
                 }
@@ -357,7 +304,8 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
         &self,
         node: usize,
         assignments: &CommunityAssignments,
-        current_modularity: f32,
+        weighted_degrees: &[f32],
+        sigma_tot: &HashMap<CommunityId, f32>,
         gamma: f32,
     ) -> Option<LocalMove> {
         let m = self._total_weight;
@@ -375,7 +323,7 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
         let k_i_to_i = community_weights.get(&c_i).copied().unwrap_or(0.0);
 
         // Score of staying in c_i (after removing i, sigma drops by k_i).
-        let baseline = k_i_to_i / m - k_i * (sigma_i - k_i) / (2.0 * m * m);
+        let baseline = k_i_to_i / m - gamma * k_i * (sigma_i - k_i) / (2.0 * m * m);
 
         let mut best_community = c_i;
         let mut best_gain: f32 = 0.0;
@@ -384,20 +332,12 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
             if c_j == c_i {
                 continue;
             }
-
-            let new_modularity = self.compute_modularity_with_local_move(
-                assignments,
-                LocalMove {
-                    node,
-                    community: neighbor_assign,
-                },
-                gamma,
-            );
-
-            if new_modularity > current_modularity {
-                best_assign = neighbor_assign;
-                current_modularity = new_modularity;
-                changed = true;
+            let sigma_j = sigma_tot.get(&c_j).copied().unwrap_or(0.0);
+            let score = k_i_to_j / m - gamma * k_i * sigma_j / (2.0 * m * m);
+            let gain = score - baseline;
+            if gain > best_gain {
+                best_gain = gain;
+                best_community = c_j;
             }
         }
 
