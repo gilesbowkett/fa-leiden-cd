@@ -14,7 +14,9 @@ pub type CommunityId = u32;
 pub struct Graph<N, E> {
     _nodes: Vec<N>,
     _edges: Vec<EdgeInfo<E>>,
-    _connections: Vec<HashMap<usize, usize>>,
+    /// Adjacency list: _connections[i] is a Vec of (neighbor_node, edge_id) pairs,
+    /// sorted by neighbor_node for O(log k) lookup.
+    _connections: Vec<Vec<(usize, usize)>>,
     _total_weight: f32,
 }
 
@@ -104,7 +106,7 @@ impl<N, E> Graph<N, E> {
     pub fn add_node(&mut self, node_data: N) -> usize {
         let id = self._nodes.len();
         self._nodes.push(node_data);
-        self._connections.push(HashMap::new());
+        self._connections.push(Vec::new());
         id
     }
 
@@ -113,28 +115,28 @@ impl<N, E> Graph<N, E> {
             return None;
         }
 
-        let conn = &self._connections[n1];
-
-        if let Some(edge_id) = conn.get(&n2) {
-            let edge_id = *edge_id;
-            let old = &mut self._edges[edge_id];
-            old.weight += weight;
-            self._total_weight += weight;
-            old.edge_data = edge_data;
-            return Some(edge_id);
+        match self._connections[n1].binary_search_by_key(&n2, |&(nb, _)| nb) {
+            Ok(pos) => {
+                let edge_id = self._connections[n1][pos].1;
+                self._edges[edge_id].weight += weight;
+                self._total_weight += weight;
+                self._edges[edge_id].edge_data = edge_data;
+                Some(edge_id)
+            }
+            Err(pos1) => {
+                let edge_id = self._edges.len();
+                self._edges.push(EdgeInfo {
+                    edge_data,
+                    weight,
+                    id: edge_id,
+                });
+                self._connections[n1].insert(pos1, (n2, edge_id));
+                let pos2 = self._connections[n2].partition_point(|&(nb, _)| nb < n1);
+                self._connections[n2].insert(pos2, (n1, edge_id));
+                self._total_weight += weight;
+                Some(edge_id)
+            }
         }
-
-        let edge_id = self._edges.len();
-        let edge_info = EdgeInfo {
-            edge_data,
-            weight,
-            id: edge_id,
-        };
-        self._edges.push(edge_info);
-        self._connections[n1].insert(n2, edge_id);
-        self._connections[n2].insert(n1, edge_id);
-        self._total_weight += weight;
-        Some(edge_id)
     }
 
     pub fn count_nodes(&self) -> usize {
@@ -142,9 +144,10 @@ impl<N, E> Graph<N, E> {
     }
 
     pub fn try_get_edge_between(&self, n1: usize, n2: usize) -> Option<&EdgeInfo<E>> {
-        self._connections[n1]
-            .get(&n2)
-            .map(|edge_id| &self._edges[*edge_id])
+        match self._connections[n1].binary_search_by_key(&n2, |&(nb, _)| nb) {
+            Ok(pos) => Some(&self._edges[self._connections[n1][pos].1]),
+            Err(_) => None,
+        }
     }
 }
 
@@ -226,8 +229,8 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
         let weighted_degrees: Vec<f32> = (0..node_count)
             .map(|i| {
                 self._connections[i]
-                    .values()
-                    .map(|&edge_id| self._edges[edge_id].weight)
+                    .iter()
+                    .map(|&(_, edge_id)| self._edges[edge_id].weight)
                     .sum()
             })
             .collect();
@@ -244,13 +247,13 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
 
                 let kj = weighted_degrees[j];
 
-                match conn_i.get(&j) {
-                    Some(edge_ij) => {
-                        let edge_ij = *edge_ij;
-                        let edge_ij_weight = self._edges[edge_ij].weight;
+                match conn_i.binary_search_by_key(&j, |&(nb, _)| nb) {
+                    Ok(pos) => {
+                        let edge_id = conn_i[pos].1;
+                        let edge_ij_weight = self._edges[edge_id].weight;
                         q += edge_ij_weight - (ki * kj) / (m + m);
                     }
-                    None => {
+                    Err(_) => {
                         q += -ki * kj / (m + m);
                     }
                 }
@@ -260,74 +263,63 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
         return q / m;
     }
 
-    /// Move a single node to avoid local minimal
-    fn _optimize_modularity_handle_pitfall(
-        &self,
-        assignments: &mut CommunityAssignments,
-        current_modularity: f32,
-    ) {
-        let node_count = self.count_nodes();
-        for i in 0..node_count {
-            let node = i;
-            if let Some(local_move) = self.fast_local_move(node, assignments, current_modularity) {
-                assignments.insert(local_move.node, local_move.community);
-            }
-        }
-    }
-
     fn optimize_modularity(
         &self,
         assignments: &mut CommunityAssignments,
         optimizer: &mut impl ModularityOptimizer,
     ) {
-        let mut current_modularity = self.compute_modularity(assignments);
         let node_count = self.count_nodes();
+
+        // Precompute weighted degrees once.
+        let weighted_degrees: Vec<f32> = (0..node_count)
+            .map(|i| {
+                self._connections[i]
+                    .iter()
+                    .map(|&(_, eid)| self._edges[eid].weight)
+                    .sum()
+            })
+            .collect();
+
+        // sigma_tot[c] = sum of weighted degrees of all nodes in community c.
+        let mut sigma_tot: HashMap<CommunityId, f32> = HashMap::new();
+        for (&node, &community) in assignments.iter() {
+            *sigma_tot.entry(community).or_insert(0.0) += weighted_degrees[node];
+        }
+
         let parallel_threshold = optimizer.get_parallel_threshold();
-        let mut previous_modularity: f32;
 
         if node_count < parallel_threshold {
-            let mut batch_moving: Vec<LocalMove> = Vec::new();
-
+            // Sequential path: apply each move immediately (online updates).
+            // This avoids the cycling that batch-then-apply can produce.
             loop {
-                previous_modularity = current_modularity;
-
+                let mut any_moved = false;
                 for i in 0..node_count {
-                    let node = i;
                     if let Some(local_move) =
-                        self.fast_local_move(node, assignments, current_modularity)
+                        self.fast_local_move(i, assignments, &weighted_degrees, &sigma_tot)
                     {
-                        batch_moving.push(local_move);
+                        let old_community = assignments[&local_move.node];
+                        let new_community = local_move.community;
+                        let k = weighted_degrees[local_move.node];
+                        *sigma_tot.get_mut(&old_community).unwrap() -= k;
+                        *sigma_tot.entry(new_community).or_insert(0.0) += k;
+                        assignments.insert(local_move.node, new_community);
+                        any_moved = true;
                     }
                 }
-
-                if batch_moving.is_empty() {
-                    break;
-                } else {
-                    for local_move in batch_moving.iter() {
-                        assignments.insert(local_move.node, local_move.community);
-                    }
-                    batch_moving.clear();
-                }
-
-                current_modularity = self.compute_modularity(assignments);
-                if current_modularity == previous_modularity {
-                    // but batch_moving is not empty
-                    // in this case we randomly choose a node to move to avoid local minimal
-                    self._optimize_modularity_handle_pitfall(assignments, current_modularity);
-                }
-                if optimizer.is_converged(previous_modularity, current_modularity) {
+                if !any_moved {
                     break;
                 }
             }
         } else {
+            // Parallel path: collect moves in parallel (read-only snapshot of state),
+            // apply serially, check convergence via global modularity to detect cycling.
             let mut batch_moving: boxcar::Vec<LocalMove> = boxcar::Vec::new();
+            let mut previous_modularity = self.compute_modularity(assignments);
 
             loop {
-                previous_modularity = current_modularity;
-
                 (0..node_count).into_par_iter().for_each(|node| {
                     if let Some(local_move) =
-                        self.fast_local_move(node, assignments, current_modularity)
+                        self.fast_local_move(node, assignments, &weighted_degrees, &sigma_tot)
                     {
                         batch_moving.push(local_move);
                     }
@@ -335,65 +327,74 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
 
                 if batch_moving.is_empty() {
                     break;
-                } else {
-                    for (_, local_move) in batch_moving.iter() {
-                        assignments.insert(local_move.node, local_move.community);
-                    }
-
-                    batch_moving.clear();
                 }
 
-                current_modularity = self.compute_modularity(assignments);
-
-                if current_modularity == previous_modularity {
-                    // but batch_moving is not empty
-                    // in this case we randomly choose a node to move to avoid local minimal
-                    self._optimize_modularity_handle_pitfall(assignments, current_modularity);
+                for (_, local_move) in batch_moving.iter() {
+                    let old_community = assignments[&local_move.node];
+                    let new_community = local_move.community;
+                    let k = weighted_degrees[local_move.node];
+                    *sigma_tot.get_mut(&old_community).unwrap() -= k;
+                    *sigma_tot.entry(new_community).or_insert(0.0) += k;
+                    assignments.insert(local_move.node, new_community);
                 }
 
+                batch_moving.clear();
+
+                let current_modularity = self.compute_modularity(assignments);
                 if optimizer.is_converged(previous_modularity, current_modularity) {
                     break;
                 }
+                previous_modularity = current_modularity;
             }
         }
     }
 
+    /// Compute the best community to move `node` to using incremental delta modularity.
+    /// Returns None if no move improves modularity.
     fn fast_local_move(
         &self,
         node: usize,
         assignments: &CommunityAssignments,
-        current_modularity: f32,
+        weighted_degrees: &[f32],
+        sigma_tot: &HashMap<CommunityId, f32>,
     ) -> Option<LocalMove> {
-        let neighbors = &self._connections[node];
-        let mut best_assign = assignments[&node];
-        let mut changed = false;
-        let mut current_modularity = current_modularity;
+        let m = self._total_weight;
+        let k_i = weighted_degrees[node];
+        let c_i = assignments[&node];
+        let sigma_i = sigma_tot.get(&c_i).copied().unwrap_or(0.0);
 
-        for &neighbor in neighbors.keys() {
-            let neighbor_assign = assignments[&neighbor];
-            if neighbor_assign == best_assign {
+        // Sum edge weights from node to each neighboring community.
+        let mut community_weights: HashMap<CommunityId, f32> = HashMap::new();
+        for &(neighbor, edge_id) in &self._connections[node] {
+            let c_j = assignments[&neighbor];
+            *community_weights.entry(c_j).or_insert(0.0) += self._edges[edge_id].weight;
+        }
+
+        let k_i_to_i = community_weights.get(&c_i).copied().unwrap_or(0.0);
+
+        // Score of staying in c_i (after removing i, sigma drops by k_i).
+        let baseline = k_i_to_i / m - k_i * (sigma_i - k_i) / (2.0 * m * m);
+
+        let mut best_community = c_i;
+        let mut best_gain: f32 = 0.0;
+
+        for (&c_j, &k_i_to_j) in &community_weights {
+            if c_j == c_i {
                 continue;
             }
-
-            let new_modularity = self.compute_modularity_with_local_move(
-                assignments,
-                LocalMove {
-                    node,
-                    community: neighbor_assign,
-                },
-            );
-
-            if new_modularity > current_modularity {
-                best_assign = neighbor_assign;
-                current_modularity = new_modularity;
-                changed = true;
+            let sigma_j = sigma_tot.get(&c_j).copied().unwrap_or(0.0);
+            let score = k_i_to_j / m - k_i * sigma_j / (2.0 * m * m);
+            let gain = score - baseline;
+            if gain > best_gain {
+                best_gain = gain;
+                best_community = c_j;
             }
         }
 
-        if changed {
+        if best_community != c_i {
             Some(LocalMove {
                 node,
-                community: best_assign,
+                community: best_community,
             })
         } else {
             None
@@ -463,13 +464,13 @@ impl<N: Send + Sync, E: Send + Sync> Graph<N, E> {
 
                 let neighbors = &self._connections[node];
 
-                for neighbor in neighbors.keys() {
-                    if !community.contains(neighbor) {
+                for &(neighbor, _) in neighbors.iter() {
+                    if !community.contains(&neighbor) {
                         // the sub-community shall not get connected via this node
                         continue;
                     }
 
-                    queue.push_back(*neighbor);
+                    queue.push_back(neighbor);
                 }
             }
 
@@ -586,7 +587,7 @@ fn compress_l1<N, E>(
     let node_count = graph.count_nodes();
     for i in 0..node_count {
         let assigni = node_to_community[&i];
-        for (&j, &edge_id) in &graph._connections[i] {
+        for &(j, edge_id) in &graph._connections[i] {
             if j <= i {
                 continue; // process each undirected edge once
             }
@@ -646,7 +647,7 @@ fn compress_ln<E>(
     let node_count = graph.count_nodes();
     for i in 0..node_count {
         let assigni = node_to_community[&i];
-        for (&j, &edge_id) in &graph._connections[i] {
+        for &(j, edge_id) in &graph._connections[i] {
             if j <= i {
                 continue; // process each undirected edge once
             }
